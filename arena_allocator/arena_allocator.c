@@ -1,205 +1,164 @@
-#include <stdio.h>
-#include <stdint.h>
+#include "arena_allocator.h"
 #include <string.h>
-#include <stdbool.h>
+#include <stdlib.h>
 
-typedef int8_t i8;
-typedef int16_t i16;
-typedef int32_t i32;
-typedef int64_t i64;
-typedef uint8_t u8;
-typedef uint16_t u16;
-typedef uint32_t u32;
-typedef uint64_t u64;
+#define ARENA_HEADER_SIZE (sizeof(arena_allocator_t))
+#define DEFAULT_ALIGNMENT (sizeof(void*))
 
-typedef i8 b8;
-typedef i32 b32;
-
-#define KiB(n) ((u64)(n) << 10)
-#define MiB(n) ((u64)(n) << 20)
-#define GiB(n) ((u64)(n) << 30)
-
-#define MIN(a, b) (((a) < (b)) ? (a) : (b))
-#define MAX(a, b) (((a) > (b)) ? (a) : (b))
-#define ALIGN_UP_POW2(n, p) (((u64)(n) + ((u64)(p) - 1)) & (~((u64)(p) - 1)))
-
-#define ARENA_BASE_POS (sizeof(mem_arena))
-#define ARENA_ALIGN (sizeof(void*))
-
-typedef struct {
-    u64 reserve_size;
-    u64 commit_size;
-
-    u64 pos;
-    u64 commit_pos;
-} mem_arena;
-
-mem_arena* arena_create(u64 reserve_size, u64 commit_size);
-void arena_destroy(mem_arena* arena);
-void* arena_push(mem_arena* arena, u64 size, b32 non_zero);
-void arena_pop(mem_arena* arena, u64 size);
-void arena_pop_to(mem_arena* arena, u64 pos);
-void arena_clear(mem_arena* arena);
-
-#define PUSH_STRUCT(arena, T) (T*)arena_push((arena), sizeof(T), false)
-#define PUSH_STRUCT_NZ(arena, T) (T*)arena_push((arena), sizeof(T), true)
-#define PUSH_ARRAY(arena, T, n) (T*)arena_push((arena), sizeof(T) * (n), false)
-#define PUSH_ARRAY_NZ(arena, T, n) (T*)arena_push((arena), sizeof(T) * (n), true)
-
-u32 plat_get_pagesize(void);
-
-void* plat_mem_reserve(u64 size);
-b32 plat_mem_commit(void* ptr, u64 size);
-b32 plat_mem_decommit(void* ptr, u64 size);
-b32 plat_mem_release(void* ptr, u64 size);
-
-int main(void) {
-    mem_arena* perm_arena = arena_create(GiB(1), MiB(1));
-
-    while (1) {
-        arena_push(perm_arena, MiB(16), false);
-        getc(stdin);
-    }
-
-    arena_destroy(perm_arena);
-
-    return 0;
+static inline size_t align_up(size_t value, size_t alignment) {
+    return (value + (alignment - 1)) & ~(alignment - 1);
 }
 
-mem_arena* arena_create(u64 reserve_size, u64 commit_size) {
-    u32 pagesize = plat_get_pagesize();
+static inline size_t min_size(size_t a, size_t b) {
+    return (a < b) ? a : b;
+}
 
-    reserve_size = ALIGN_UP_POW2(reserve_size, pagesize);
-    commit_size = ALIGN_UP_POW2(commit_size, pagesize);
+static uint32_t platform_get_page_size(void);
+static void* platform_reserve_memory(size_t size);
+static bool platform_commit_memory(void* ptr, size_t size);
+static bool platform_release_memory(void* ptr, size_t size);
 
-    mem_arena* arena = plat_mem_reserve(reserve_size);
+arena_allocator_t* arena_create(size_t reserve_size, size_t commit_size) {
+    if (reserve_size == 0 || commit_size == 0) {
+        return NULL;
+    }
 
-    if (!plat_mem_commit(arena, commit_size)) {
+    uint32_t page_size = platform_get_page_size();
+    reserve_size = align_up(reserve_size, page_size);
+    commit_size = align_up(commit_size, page_size);
+
+    if (commit_size > reserve_size) {
+        commit_size = reserve_size;
+    }
+
+    arena_allocator_t* arena = (arena_allocator_t*)platform_reserve_memory(reserve_size);
+    if (arena == NULL) {
+        return NULL;
+    }
+
+    if (!platform_commit_memory(arena, commit_size)) {
+        platform_release_memory(arena, reserve_size);
         return NULL;
     }
 
     arena->reserve_size = reserve_size;
     arena->commit_size = commit_size;
-    arena->pos = ARENA_BASE_POS;
-    arena->commit_pos = commit_size;
-    
+    arena->position = ARENA_HEADER_SIZE;
+    arena->commit_position = commit_size;
+
     return arena;
 }
 
-void arena_destroy(mem_arena* arena) {
-    plat_mem_release(arena, arena->reserve_size);
+void arena_destroy(arena_allocator_t* arena) {
+    if (arena != NULL) {
+        platform_release_memory(arena, arena->reserve_size);
+    }
 }
 
-void* arena_push(mem_arena* arena, u64 size, b32 non_zero) {
-    u64 pos_aligned = ALIGN_UP_POW2(arena->pos, ARENA_ALIGN);
-    u64 new_pos = pos_aligned + size;
+void* arena_alloc(arena_allocator_t* arena, size_t size) {
+    return arena_alloc_aligned(arena, size, DEFAULT_ALIGNMENT);
+}
 
-    if (new_pos > arena->reserve_size) { return NULL; }
+void* arena_alloc_aligned(arena_allocator_t* arena, size_t size, size_t alignment) {
+    if (arena == NULL || size == 0) {
+        return NULL;
+    }
 
-    if (new_pos > arena->commit_pos) {
-        u64 new_commit_pos = new_pos;
-        new_commit_pos += arena->commit_size - 1;
-        new_commit_pos -= new_commit_pos % arena->commit_size;
-        new_commit_pos = MIN(new_commit_pos, arena->reserve_size);
+    size_t aligned_position = align_up(arena->position, alignment);
+    size_t new_position = aligned_position + size;
 
-        u8* mem = (u8*)arena + arena->commit_pos;
-        u64 commit_size = new_commit_pos - arena->commit_pos;
+    if (new_position > arena->reserve_size) {
+        return NULL;
+    }
 
-        if (!plat_mem_commit(mem, commit_size)) {
+    if (new_position > arena->commit_position) {
+        size_t new_commit_position = align_up(new_position, arena->commit_size);
+        new_commit_position = min_size(new_commit_position, arena->reserve_size);
+
+        uint8_t* commit_ptr = (uint8_t*)arena + arena->commit_position;
+        size_t commit_amount = new_commit_position - arena->commit_position;
+
+        if (!platform_commit_memory(commit_ptr, commit_amount)) {
             return NULL;
         }
 
-        arena->commit_pos = new_commit_pos;
+        arena->commit_position = new_commit_position;
     }
 
-    arena->pos = new_pos;
+    arena->position = new_position;
 
-    u8* out = (u8*)arena + pos_aligned;
+    void* result = (uint8_t*)arena + aligned_position;
+    memset(result, 0, size);
 
-    if (!non_zero) {
-        memset(out, 0, size);
+    return result;
+}
+
+void arena_reset(arena_allocator_t* arena) {
+    if (arena != NULL) {
+        arena->position = ARENA_HEADER_SIZE;
     }
-
-    return out;
 }
 
-void arena_pop(mem_arena* arena, u64 size) {
-    size = MIN(size, arena->pos - ARENA_BASE_POS);
-    arena->pos -= size;
+size_t arena_get_position(const arena_allocator_t* arena) {
+    return (arena != NULL) ? arena->position : 0;
 }
 
-void arena_pop_to(mem_arena* arena, u64 pos) {
-    u64 size = pos < arena->pos ? arena->pos - pos : 0;
-    arena_pop(arena, size);
+void arena_set_position(arena_allocator_t* arena, size_t position) {
+    if (arena != NULL && position >= ARENA_HEADER_SIZE && position <= arena->reserve_size) {
+        arena->position = position;
+    }
 }
 
-void arena_clear(mem_arena* arena) {
-    arena_pop_to(arena, ARENA_BASE_POS);
-}
-
-#if defined(_WIN32)
+#if defined(_WIN32) || defined(_WIN64)
 
 #include <windows.h>
 
-u32 plat_get_pagesize(void) {
-    SYSTEM_INFO sysinfo = { 0 };
-    GetSystemInfo(&sysinfo);
-
-    return sysinfo.dwPageSize;
+static uint32_t platform_get_page_size(void) {
+    SYSTEM_INFO system_info;
+    GetSystemInfo(&system_info);
+    return (uint32_t)system_info.dwPageSize;
 }
 
-void* plat_mem_reserve(u64 size) {
+static void* platform_reserve_memory(size_t size) {
     return VirtualAlloc(NULL, size, MEM_RESERVE, PAGE_READWRITE);
 }
 
-b32 plat_mem_commit(void* ptr, u64 size) {
-    void* ret = VirtualAlloc(ptr, size, MEM_COMMIT, PAGE_READWRITE);
-    return ret != NULL;
+static bool platform_commit_memory(void* ptr, size_t size) {
+    void* result = VirtualAlloc(ptr, size, MEM_COMMIT, PAGE_READWRITE);
+    return (result != NULL);
 }
 
-b32 plat_mem_decommit(void* ptr, u64 size) {
-    return VirtualFree(ptr, size, MEM_DECOMMIT);
+static bool platform_release_memory(void* ptr, size_t size) {
+    (void)size;
+    return VirtualFree(ptr, 0, MEM_RELEASE) != 0;
 }
 
-b32 plat_mem_release(void* ptr, u64 size) {
-    return VirtualFree(ptr, size, MEM_RELEASE);
-}
-
-
-#elif defined(__linux__)
+#elif defined(__linux__) || defined(__unix__) || defined(__APPLE__)
 
 #define _DEFAULT_SOURCE
-
 #include <unistd.h>
 #include <sys/mman.h>
 
-u32 plat_get_pagesize(void) {
-    return (u32)sysconf(_SC_PAGESIZE);
+static uint32_t platform_get_page_size(void) {
+    long page_size = sysconf(_SC_PAGESIZE);
+    return (page_size > 0) ? (uint32_t)page_size : 4096;
 }
 
-void* plat_mem_reserve(u64 size) {
-    void* out = mmap(NULL, size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (out == MAP_FAILED) {
-        return NULL;
-    }
-    return out;
+static void* platform_reserve_memory(size_t size) {
+    void* ptr = mmap(NULL, size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    return (ptr != MAP_FAILED) ? ptr : NULL;
 }
 
-b32 plat_mem_commit(void* ptr, u64 size) {
-    i32 ret = mprotect(ptr, size, PROT_READ | PROT_WRITE);
-    return ret == 0;
+static bool platform_commit_memory(void* ptr, size_t size) {
+    int result = mprotect(ptr, size, PROT_READ | PROT_WRITE);
+    return (result == 0);
 }
 
-b32 plat_mem_decommit(void* ptr, u64 size) {
-    i32 ret = mprotect(ptr, size, PROT_NONE);
-    if (ret != 0) return false;
-    ret = madvise(ptr, size, MADV_DONTNEED);
-    return ret == 0;
+static bool platform_release_memory(void* ptr, size_t size) {
+    int result = munmap(ptr, size);
+    return (result == 0);
 }
 
-b32 plat_mem_release(void* ptr, u64 size) {
-    i32 ret = munmap(ptr, size);
-    return ret == 0;
-}
-
+#else
+#error "Unsupported platform"
 #endif
